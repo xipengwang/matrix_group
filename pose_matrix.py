@@ -2,6 +2,7 @@
 
 import argparse
 import sys
+import copy
 
 import mpl_toolkits.mplot3d.proj3d as proj3d
 from mpl_toolkits.mplot3d import Axes3D
@@ -97,8 +98,8 @@ def main():
     cov[12*len(odom_Z):12+12*len(Z), 12*len(odom_Z):12+12*len(Z)] *= 0.01
     max_iter = int(args.max_iter) if args.max_iter else 50
     iter = 0
-    r_eps = 1e-9
-    poses_est = poses_init
+    r_eps = 1e-4
+    poses_est = copy.deepcopy(poses_init)
     while iter < max_iter:
         print("Iter: ", iter)
         iter += 1
@@ -244,6 +245,15 @@ def main():
         if np.linalg.norm(r - last_r) < r_eps:
             break
         last_r[:] = r[:]
+        ax.clear()
+        plot_poses(ax, poses, pose_links, 'r', True)
+        plot_poses(ax, poses_init, pose_links, 'g')
+        plot_poses(ax, poses_est, pose_links, 'b')
+        plt.pause(0.2)
+
+    ax.clear()
+    plot_poses(ax, poses, pose_links, 'r')
+    plot_poses(ax, poses_init, pose_links, 'g')
     plot_poses(ax, poses_est, pose_links, 'b')
     print("Pose to pose links: \n", pose_links)
     plt.show()
