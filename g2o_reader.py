@@ -3,7 +3,7 @@ import os
 import argparse
 import numpy as np
 
-def read_g2o(file_path):
+def read_g2o(file_path, MAX_ID):
     print("reading " + file_path)
     vertex = 0
     edge = 0
@@ -11,7 +11,6 @@ def read_g2o(file_path):
         poses_init = []
         Z = []
         pose_links = []
-        MAX_ID = 10
         for line in f:
             entries = line.split(" ")
             if vertex == 0 and entries[0] == 'VERTEX_SE3:QUAT':

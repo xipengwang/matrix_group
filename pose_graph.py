@@ -5,6 +5,7 @@ from g2o_reader import read_g2o
 import argparse
 import sys
 import copy
+import time
 
 import mpl_toolkits.mplot3d.proj3d as proj3d
 from mpl_toolkits.mplot3d import Axes3D
@@ -13,17 +14,22 @@ from matplotlib.patches import FancyArrowPatch
 from scipy.linalg import expm, logm
 from math import sin, cos, sqrt
 import numpy as np
-np.set_printoptions(threshold=sys.maxsize)
+np.set_printoptions(precision=9, linewidth=300,
+                    suppress=True, threshold=sys.maxsize)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--mode', choices=["sync", "matrix"], required=True)
     parser.add_argument(
-        '--sigma-scale'
+        '--sigma-scale',
+        default=0.1,
+        type=float
     )
     parser.add_argument(
-        '--max-iter'
+        '--max-iter',
+        default=50,
+        type=int
     )
     parser.add_argument(
         '--no-noise',
@@ -32,14 +38,19 @@ def main():
     parser.add_argument(
         '--g2o-file',
     )
+    parser.add_argument(
+        '--max-id',
+        default=20,
+        type=int
+    )
     args = parser.parse_args()
 
     np.random.seed(0)
-    U = [Lie.from_rpy_xyz(0., 0., 0., 2, 1, 0),  # T1 + T01 = T0
-         Lie.from_rpy_xyz(0., 0., 0., 2, 1, 0),
-         Lie.from_rpy_xyz(0., 0., 0., 0, 2, 1),
-         Lie.from_rpy_xyz(0., 0., 0., -2, -1, 0),
-         Lie.from_rpy_xyz(0., 0., 0., -2, -1, 0),
+    U = [Lie.from_rpy_xyz(0., 0., 1., 2, 1, 0),  # T0 + T01 = T1
+         Lie.from_rpy_xyz(0., 1., 0., 2, 1, 0),
+         Lie.from_rpy_xyz(0., 0., 1., 0, 2, 1),
+         Lie.from_rpy_xyz(0., 1., 0., -2, -1, 0),
+         Lie.from_rpy_xyz(0., 0., 1., -2, -1, 0),
          ]
 
     poses = [np.eye(4)]
@@ -48,9 +59,8 @@ def main():
         poses.append(poses[-1].dot(u))
         pose_links.append((i, i + 1))
 
-    kStdScale = float(args.sigma_scale) if args.sigma_scale else 1
     Sigma = np.diag([0.05**2, 0.03**2, 0.03**2, 0.05**2, 0.05**2, 0.05**2])
-    L = cholesky(Sigma * kStdScale**2)
+    L = cholesky(Sigma * args.sigma_scale**2)
     odom_Z = []
     for u in U:
         noise = L.dot(np.random.normal(0, 1, (6, 1)))
@@ -79,7 +89,7 @@ def main():
     Z = U + loop_Z if args.no_noise else odom_Z + loop_Z
 
     if args.g2o_file is not None:
-        (poses_init, Z, pose_links) = read_g2o(args.g2o_file)
+        (poses_init, Z, pose_links) = read_g2o(args.g2o_file, args.max_id)
         poses = poses_init
     # ax.clear()
     # print(poses_init[0])
@@ -88,22 +98,59 @@ def main():
     # return
 
     # Jacobian
-    J, r, last_r, cov = init_for_sync(
-        poses_init=poses_init, odom_Z=odom_Z, Z=Z) if args.mode == "sync" else init_for_matrix(
-        poses_init=poses_init, odom_Z=odom_Z, Z=Z)
-    max_iter = int(args.max_iter) if args.max_iter else 50
+    last_r, cov = init_for_sync(
+        odom_Z=odom_Z, Z=Z) if args.mode == "sync" else init_for_matrix(odom_Z=odom_Z, Z=Z)
+
     iter = 0
     r_eps = 1e-2
     poses_est = copy.deepcopy(poses_init)
-    while iter < max_iter:
+    loop_closures = [pose_link for pose_link in pose_links if (pose_link[1] - pose_link[0] != 1)]
+    print(f"{len(loop_closures)} loop closures: \n {loop_closures}")
+
+    while iter < args.max_iter:
         print("Iter: ", iter)
         iter += 1
         if args.mode == "sync":
-            update_J_r_for_sync(poses_init=poses_init, poses_est=poses_est,
-                                pose_links=pose_links, Z=Z, cov=cov, J=J, r=r)
+            # J = J_for_sync_numerical(
+            #    poses_init=poses_init, poses_est=poses_est, pose_links=pose_links, Z=Z)
+            # r = J_r_for_sync(poses_init=poses_init, poses_est=poses_est,
+            #                 pose_links=pose_links, Z=Z, cal_jacobian=False)
+            J, r = J_r_for_sync(poses_init=poses_init, poses_est=poses_est,
+                                pose_links=pose_links, Z=Z, cal_jacobian=True)
+            A = np.linalg.multi_dot([J.transpose(), np.linalg.inv(cov), J])
+            b = np.linalg.multi_dot([J.transpose(), np.linalg.inv(cov), -r])
+            dx = solve_Ab(A, b)
+            # dx = np.linalg.inv(A).dot(b)
+            for i in range(len(poses_est)):
+                poses_est[i] = poses_est[i].dot(
+                    expm(Lie.hat(dx[i * 6:(i + 1) * 6])))
+            print("residual: ", np.linalg.norm(r))
         else:
-            update_J_r_for_matrix(poses_init=poses_init, poses_est=poses_est,
-                                  pose_links=pose_links, Z=Z, cov=cov, J=J, r=r)
+            # J = J_for_matrix_numerical(
+            #    poses_init=poses_init, poses_est=poses_est, pose_links=pose_links, Z=Z)
+            # r = J_r_for_matrix(poses_init=poses_init, poses_est=poses_est,
+            #                   pose_links=pose_links, Z=Z, cal_jacobian=False)
+            # start = time.time()
+            J, r = J_r_for_matrix(poses_init=poses_init, poses_est=poses_est,
+                                  pose_links=pose_links, Z=Z, cal_jacobian=True)
+            # print(time.time() - start)
+            A = np.linalg.multi_dot([J.transpose(), np.linalg.inv(cov), J])
+            b = np.linalg.multi_dot([J.transpose(), np.linalg.inv(cov), -r])
+            # print(time.time() - start)
+            dx = solve_Ab(A, b)
+            # print(time.time() - start)
+            for i in range(len(poses_est)):
+                poses_est[i][0:3, 0:3] = poses_est[i][0:3, 0:3] + \
+                    dx[12 * i:12 * i + 9].reshape(3, 3)
+                # Polarization
+                U, _, V = np.linalg.svd(
+                    poses_est[i][0:3, 0:3], full_matrices=True)
+                S = np.eye(3)
+                S[2, 2] = 1 if np.linalg.det(U) * np.linalg.det(V) > 0 else -1
+                poses_est[i][0:3, 0:3] = U.dot(S).dot(V)
+                poses_est[i][0:3, [3]] = poses_est[i][0:3, [3]] + \
+                    dx[12 * i + 9:12 * i + 12]
+            print("residual: ", np.linalg.norm(r))
 
         if np.linalg.norm(r - last_r) < r_eps:
             break
@@ -118,23 +165,46 @@ def main():
     plot_poses(ax, poses, pose_links, 'r', True)
     plot_poses(ax, poses_init, pose_links, 'g')
     plot_poses(ax, poses_est, pose_links, 'b')
-    print("Pose to pose links: \n", pose_links)
     plt.show()
 
 
-def init_for_sync(*, poses_init, odom_Z, Z):
-    J = np.zeros((6 + 6 * len(Z), 6 * len(poses_init)))
-    r = np.zeros((6 + 6 * len(Z), 1))
+def init_for_sync(*, odom_Z, Z):
     last_r = np.zeros((6 + 6 * len(Z), 1))
     cov = np.eye(6 + 6 * len(Z))
     # Set supper small variance for first measurement
     cov[0:6, 0:6] *= 0.000001
     # Trust more of loop closures
     cov[6 * len(odom_Z):6 + 6 * len(Z), 6 * len(odom_Z):6 + 6 * len(Z)] *= 0.01
-    return (J, r, last_r, cov)
+    return (last_r, cov)
 
 
-def update_J_r_for_sync(*, poses_init, poses_est, pose_links, Z, cov, J, r):
+def J_for_sync_numerical(*, poses_init, poses_est, pose_links, Z):
+    J = np.zeros((6 + 6 * len(Z), 6 * len(poses_init)))
+    kDelta = 0.00001
+    for col in range(J.shape[1]):
+        pose_idx = col // 6
+        param_idx = col % 6
+        new_poses_est = copy.deepcopy(poses_est)
+        eta = np.zeros((6, 1))
+        eta_plus = copy.deepcopy(eta)
+        eta_plus[param_idx] += kDelta
+        eta_minus = copy.deepcopy(eta)
+        eta_minus[param_idx] -= kDelta
+        new_poses_est[pose_idx] = poses_est[pose_idx].dot(
+            expm(Lie.hat(eta_plus)))
+        r_plus = J_r_for_sync(poses_init=poses_init, poses_est=new_poses_est,
+                              pose_links=pose_links, Z=Z, cal_jacobian=False)
+        new_poses_est[pose_idx] = poses_est[pose_idx].dot(
+            expm(Lie.hat(eta_minus)))
+        r_minus = J_r_for_sync(poses_init=poses_init, poses_est=new_poses_est,
+                               pose_links=pose_links, Z=Z, cal_jacobian=False)
+        J[:, [col]] = (r_plus - r_minus) / (2 * kDelta)
+    return J
+
+
+def J_r_for_sync(*, poses_init, poses_est, pose_links, Z, cal_jacobian):
+    J = np.zeros((6 + 6 * len(Z), 6 * len(poses_init)))
+    r = np.zeros((6 + 6 * len(Z), 1))
     r[0:6] = Lie.vee(logm(np.linalg.inv(poses_init[0]).dot(poses_est[0])))
     J[0:6, 0:6] = Lie.RightJacobianInverse_SE3(r[0:6])
     for i, (a, b) in enumerate(pose_links):
@@ -144,175 +214,156 @@ def update_J_r_for_sync(*, poses_init, poses_est, pose_links, Z, cov, J, r):
         # r = vee(log(T_a.inv()*T_b)) - vee(log(T_ab))
         # r = vee(log(T_ba * (T_a.inv()*T_b)))
         res_idx = 6 * (i + 1)
-        res = Lie.vee(np.linalg.inv(Z[i]).dot(
-            np.linalg.inv(poses_est[a]).dot(poses_est[b])))
+
+        R_ab_z = Z[i][:3, :3]
+        t_ab_z = Z[i][:3, [3]]
+        R_ba_z = R_ab_z.transpose()
+        t_ba_z = -R_ab_z.transpose().dot(t_ab_z)
+        T_a = poses_est[a]
+        T_b = poses_est[b]
+        R_a = T_a[:3, :3]
+        R_b = T_b[:3, :3]
+        t_a = T_a[0:3, [3]]
+        t_b = T_b[0:3, [3]]
+        R_ab = R_a.transpose().dot(R_b)
+        tb_minus_ta = t_b - t_a
+        t_ab = R_a.transpose().dot(tb_minus_ta)
+
+        # res = Lie.vee(np.linalg.inv(Z[i]).dot(
+        #     np.linalg.inv(poses_est[a]).dot(poses_est[b])))
+        r_T = np.zeros((4, 4))
+        r_T[3, 3] = 1
+        r_T[:3, :3] = R_ba_z.dot(R_a.transpose()).dot(R_b)
+        r_T[:3, [3]] = R_ba_z.dot(R_a.transpose()).dot(tb_minus_ta) + t_ba_z
+        res = Lie.vee(r_T)
+
         r[res_idx:res_idx + 6] = res
+        if not cal_jacobian:
+            continue
         # Measurement is T_ab = T_a.inv() * T_b
-        T_ba = np.linalg.inv(poses_est[b]).dot(poses_est[a])
+        T_ba = np.zeros((4, 4))
+        T_ba[3, 3] = 1
+        T_ba[:3, :3] = R_b.transpose().dot(R_a)
+        T_ba[:3, [3]] = R_b.transpose().dot(t_a - t_b)
         J[res_idx:res_idx + 6, a * 6:(a + 1) * 6] = - \
             Lie.RightJacobianInverse_SE3(res).dot(Lie.Adjoint_SE3(T_ba))
         J[res_idx:res_idx + 6, b *
           6:(b + 1) * 6] = Lie.RightJacobianInverse_SE3(res)
         # solve normal equations
-    A = np.linalg.multi_dot([J.transpose(), np.linalg.inv(cov), J])
-    b = np.linalg.multi_dot([J.transpose(), np.linalg.inv(cov), -r])
-    dx = solve_Ab(A,b)
-    # dx = np.linalg.inv(A).dot(b)
-    for i in range(len(poses_est)):
-        poses_est[i] = poses_est[i].dot(expm(Lie.hat(dx[i * 6:(i + 1) * 6])))
-    print("residual: ", np.linalg.norm(r))
+    if not cal_jacobian:
+        return r
+    else:
+        return (J, r)
 
 
-def init_for_matrix(*, poses_init, odom_Z, Z):
-    J = np.zeros((12 + 12 * len(Z), 12 * len(poses_init)))
-    r = np.zeros((12 + 12 * len(Z), 1))
+def init_for_matrix(*, odom_Z, Z):
     last_r = np.zeros((12 + 12 * len(Z), 1))
     cov = np.eye(12 + 12 * len(Z))
     # Set supper small variance for first measurement
     cov[0:12, 0:12] *= 0.000001
     # Trust more of loop closures
-    cov[12 * len(odom_Z):12 + 12 * len(Z), 12 * len(odom_Z):12 + 12 * len(Z)] *= 0.01
-    return (J, r, last_r, cov)
+    cov[12 * len(odom_Z):12 + 12 * len(Z), 12 *
+        len(odom_Z):12 + 12 * len(Z)] *= 0.01
+    return (last_r, cov)
 
 
-def update_J_r_for_matrix(*, poses_init, poses_est, pose_links, Z, cov, J, r):
+def J_for_matrix_numerical(*, poses_init, poses_est, pose_links, Z):
+    J = np.zeros(((len(Z) + 1) * 12, len(poses_init) * 12))
+    kDelta = 0.00001
+    for col in range(J.shape[1]):
+        pose_idx = col // 12
+        pose_col = col % 12
+        if pose_col < 9:
+            i = pose_col // 3
+            j = pose_col % 3
+        else:
+            i = pose_col % 3
+            j = 3
+        new_poses_est_plus = copy.deepcopy(poses_est)
+        new_poses_est_plus[pose_idx][i, j] = poses_est[pose_idx][i, j] + kDelta
+        r_plus = J_r_for_matrix(poses_init=poses_init, poses_est=new_poses_est_plus,
+                                pose_links=pose_links, Z=Z, cal_jacobian=False)
+        new_poses_est_minus = copy.deepcopy(poses_est)
+        new_poses_est_minus[pose_idx][i, j] = poses_est[pose_idx][i, j] - kDelta
+        r_minus = J_r_for_matrix(poses_init=poses_init, poses_est=new_poses_est_minus,
+                                 pose_links=pose_links, Z=Z, cal_jacobian=False)
+        J[:, [col]] = (r_plus - r_minus) / (2 * kDelta)
+    return J
+
+
+def J_r_for_matrix(*, poses_init, poses_est, pose_links, Z, cal_jacobian):
+    J = np.zeros(((len(Z) + 1) * 12, len(poses_init) * 12))
+    r = np.zeros(((len(Z) + 1) * 12, 1))
     r[0:9] = (poses_est[0][0:3, 0:3] - np.eye(3)).reshape(9, 1)
     r[9:12] = poses_est[0][0:3, [3]] - poses_init[0][0:3, [3]]
     J[:12, :12] = np.eye(12)
     for i, (a, b) in enumerate(pose_links):
         res_idx = 12 * (i + 1)
-        T_ba_z = np.linalg.inv(Z[i])
+        R_ab_z = Z[i][:3, :3]
+        t_ab_z = Z[i][:3, [3]]
+        R_ba_z = R_ab_z.transpose()
+        t_ba_z = -R_ab_z.transpose().dot(t_ab_z)
+        # T_ba_z = np.linalg.inv(Z[i])
+        # assert(np.allclose(R_ba_z, T_ba_z[:3, :3]))
+        # assert(np.allclose(t_ba_z, T_ba_z[:3, [3]]))
         T_a = poses_est[a]
         T_b = poses_est[b]
-        R_a = np.zeros((4, 4))
-        R_a[1:4, 1:4] = T_a[:3, :3]
-        R_b = np.zeros((4, 4))
-        R_b[1:4, 1:4] = T_b[:3, :3]
+        R_a = T_a[:3, :3]
+        R_b = T_b[:3, :3]
         t_a = T_a[0:3, [3]]
         t_b = T_b[0:3, [3]]
-        T_ab = np.linalg.inv(T_a).dot(T_b)
-        r[res_idx:res_idx +
-          9] = (T_ba_z[:3, :3].dot(T_ab[:3, :3]) - np.eye(3)).reshape(9, 1)
-        r[res_idx + 9:res_idx + 12] = T_ba_z[:3,
-                                             :3].dot(T_ab[:3, [3]]) + T_ba_z[:3, [3]]
-        base_a = a * 12
+        R_ab = R_a.transpose().dot(R_b)
         tb_minus_ta = t_b - t_a
-        J[res_idx, base_a:base_a + 9] = np.array([[R_b[1, 1] * R_a[1, 1], R_b[1, 1] * R_a[1, 2], R_b[1, 1] * R_a[1, 3],
-                                                   R_b[2, 1] * R_a[1, 1], R_b[2, 1] *
-                                                   R_a[1, 2], R_b[2, 1] *
-                                                   R_a[1, 3],
-                                                   R_b[3, 1] * R_a[1, 1], R_b[3, 1] * R_a[1, 2], R_b[3, 1] * R_a[1, 3]]])
-        J[res_idx + 1, base_a:base_a + 9] = np.array([[R_b[1, 2] * R_a[1, 1], R_b[1, 2] * R_a[1, 2], R_b[1, 2] * R_a[1, 3],
-                                                       R_b[2, 2] * R_a[1, 1], R_b[2, 2] *
-                                                       R_a[1, 2], R_b[2,
-                                                                      2] * R_a[1, 3],
-                                                       R_b[3, 2] * R_a[1, 1], R_b[3, 2] * R_a[1, 2], R_b[3, 3] * R_a[1, 3]]])
-        J[res_idx + 2, base_a:base_a + 9] = np.array([[R_b[1, 3] * R_a[1, 1], R_b[1, 3] * R_a[1, 3], R_b[1, 3] * R_a[1, 3],
-                                                       R_b[2, 3] * R_a[1, 1], R_b[2, 3] *
-                                                       R_a[1, 3], R_b[2,
-                                                                      3] * R_a[1, 3],
-                                                       R_b[3, 3] * R_a[1, 1], R_b[3, 3] * R_a[1, 3], R_b[3, 3] * R_a[1, 3]]])
+        t_ab = R_a.transpose().dot(tb_minus_ta)
+        # T_ab = np.linalg.inv(T_a).dot(T_b)
+        # assert(np.allclose(t_ab, T_ab[:3, [3]]))
+        # assert(np.allclose(R_ab, T_ab[:3, :3]))
+        r[res_idx:res_idx +
+          9] = (R_ba_z.dot(R_ab) - np.eye(3)).reshape(9, 1)
+        r[res_idx + 9:res_idx + 12] = R_ba_z.dot(t_ab) + t_ba_z
+        if not cal_jacobian:
+            continue
 
-        J[res_idx + 3, base_a:base_a + 9] = np.array([[R_b[1, 1] * R_a[2, 1], R_b[1, 1] * R_a[2, 2], R_b[1, 1] * R_a[2, 3],
-                                                       R_b[2, 1] * R_a[2, 1], R_b[2, 1] *
-                                                       R_a[2, 2], R_b[2,
-                                                                      1] * R_a[2, 3],
-                                                       R_b[3, 1] * R_a[2, 1], R_b[3, 1] * R_a[2, 2], R_b[3, 1] * R_a[2, 3]]])
-        J[res_idx + 4, base_a:base_a + 9] = np.array([[R_b[1, 2] * R_a[2, 1], R_b[1, 2] * R_a[2, 2], R_b[1, 2] * R_a[2, 3],
-                                                       R_b[2, 2] * R_a[2, 1], R_b[2, 2] *
-                                                       R_a[2, 2], R_b[2,
-                                                                      2] * R_a[2, 3],
-                                                       R_b[3, 2] * R_a[2, 1], R_b[3, 2] * R_a[2, 2], R_b[3, 3] * R_a[2, 3]]])
-        J[res_idx + 5, base_a:base_a + 9] = np.array([[R_b[1, 3] * R_a[2, 1], R_b[1, 3] * R_a[2, 3], R_b[1, 3] * R_a[2, 3],
-                                                       R_b[2, 3] * R_a[2, 1], R_b[2, 3] *
-                                                       R_a[2, 3], R_b[2,
-                                                                      3] * R_a[2, 3],
-                                                       R_b[3, 3] * R_a[2, 1], R_b[3, 3] * R_a[2, 3], R_b[3, 3] * R_a[2, 3]]])
+        # J for pose_a.
+        base_a = a * 12
+        R_idx = range(base_a, base_a + 9)
+        t_idx = range(base_a + 9, base_a + 12)
+        for idx in range(9):
+            row = idx // 3
+            col = idx % 3
+            # R_a
+            J[res_idx + idx, R_idx] = R_ba_z[[row], :].transpose().dot(R_b[:, [col]].transpose()).transpose().reshape(1, 9)
+        for idx in range(9, 12):
+            row = (idx - 9) % 3
+            # R_a
+            J[res_idx + idx, R_idx] = R_ba_z[[row], :].transpose().dot(tb_minus_ta[:].transpose()).transpose().reshape(1, 9)
 
-        J[res_idx + 6, base_a:base_a + 9] = np.array([[R_b[1, 1] * R_a[3, 1], R_b[1, 1] * R_a[3, 2], R_b[1, 1] * R_a[3, 3],
-                                                       R_b[2, 1] * R_a[3, 1], R_b[2, 1] *
-                                                       R_a[3, 2], R_b[2,
-                                                                      1] * R_a[3, 3],
-                                                       R_b[3, 1] * R_a[3, 1], R_b[3, 1] * R_a[3, 2], R_b[3, 1] * R_a[3, 3]]])
-        J[res_idx + 7, base_a:base_a + 9] = np.array([[R_b[1, 2] * R_a[3, 1], R_b[1, 2] * R_a[3, 2], R_b[1, 2] * R_a[3, 3],
-                                                       R_b[2, 2] * R_a[3, 1], R_b[2, 2] *
-                                                       R_a[3, 2], R_b[2,
-                                                                      2] * R_a[3, 3],
-                                                       R_b[3, 2] * R_a[3, 1], R_b[3, 2] * R_a[3, 2], R_b[3, 3] * R_a[3, 3]]])
-        J[res_idx + 8, base_a:base_a + 9] = np.array([[R_b[1, 3] * R_a[3, 1], R_b[1, 3] * R_a[3, 3], R_b[1, 3] * R_a[3, 3],
-                                                       R_b[2, 3] * R_a[3, 1], R_b[2, 3] *
-                                                       R_a[3, 3], R_b[2,
-                                                                      3] * R_a[3, 3],
-                                                       R_b[3, 3] * R_a[3, 1], R_b[3, 3] * R_a[3, 3], R_b[3, 3] * R_a[3, 3]]])
+        # t_a
+        J[res_idx + 9:res_idx + 12, t_idx] = -R_ba_z.dot(R_a.transpose())
 
-        J[res_idx + 9, base_a] = tb_minus_ta[0]
-        J[res_idx + 9, base_a + 3] = tb_minus_ta[0]
-        J[res_idx + 9, base_a + 6] = tb_minus_ta[0]
-        J[res_idx + 10, base_a + 1] = tb_minus_ta[1]
-        J[res_idx + 10, base_a + 4] = tb_minus_ta[1]
-        J[res_idx + 10, base_a + 7] = tb_minus_ta[1]
-        J[res_idx + 11, base_a + 2] = tb_minus_ta[2]
-        J[res_idx + 11, base_a + 5] = tb_minus_ta[2]
-        J[res_idx + 11, base_a + 8] = tb_minus_ta[2]
-
-        J[res_idx + 9:res_idx + 12, base_a + 0:base_a +
-          3] = np.array([[tb_minus_ta[0], tb_minus_ta[0], tb_minus_ta[0]]])
-        J[res_idx + 9:res_idx + 12, base_a + 3:base_a +
-          6] = np.array([[tb_minus_ta[1], tb_minus_ta[1], tb_minus_ta[1]]])
-        J[res_idx + 9:res_idx + 12, base_a + 6:base_a +
-          9] = np.array([[tb_minus_ta[2], tb_minus_ta[2], tb_minus_ta[2]]])
-
-        J[res_idx + 9:res_idx + 12, base_a + 9:base_a + 12] = - \
-            T_ba_z[:3, :3].dot(T_a[:3, :3].transpose())
-        #
+        # J for pose_b.
         base_b = b * 12
-        R_ji_ig = T_ba_z[:3, :3].dot(T_a[:3, :3].transpose())
-        J[res_idx, base_b] = R_ji_ig[0, 0]
-        J[res_idx, base_b + 3] = R_ji_ig[0, 1]
-        J[res_idx, base_b + 6] = R_ji_ig[0, 2]
-        J[res_idx + 1, base_b + 1] = R_ji_ig[0, 0]
-        J[res_idx + 1, base_b + 4] = R_ji_ig[0, 1]
-        J[res_idx + 1, base_b + 7] = R_ji_ig[0, 2]
-        J[res_idx + 2, base_b + 2] = R_ji_ig[0, 0]
-        J[res_idx + 2, base_b + 5] = R_ji_ig[0, 1]
-        J[res_idx + 2, base_b + 8] = R_ji_ig[0, 2]
+        R_idx = range(base_b, base_b + 9)
+        t_idx = range(base_b + 9, base_b + 12)
+        R_bg_z = R_ba_z.dot(R_a.transpose())
 
-        J[res_idx + 3, base_b] = R_ji_ig[1, 0]
-        J[res_idx + 3, base_b + 3] = R_ji_ig[1, 1]
-        J[res_idx + 3, base_b + 6] = R_ji_ig[1, 2]
-        J[res_idx + 4, base_b + 1] = R_ji_ig[1, 0]
-        J[res_idx + 4, base_b + 4] = R_ji_ig[1, 1]
-        J[res_idx + 4, base_b + 7] = R_ji_ig[1, 2]
-        J[res_idx + 5, base_b + 2] = R_ji_ig[1, 0]
-        J[res_idx + 5, base_b + 5] = R_ji_ig[1, 1]
-        J[res_idx + 5, base_b + 8] = R_ji_ig[1, 2]
+        J[res_idx: res_idx + 3, base_b: base_b + 3] = R_bg_z[0, 0] * np.eye(3)
+        J[res_idx: res_idx + 3, base_b + 3: base_b + 6] = R_bg_z[0, 1] * np.eye(3)
+        J[res_idx: res_idx + 3, base_b + 6: base_b + 9] = R_bg_z[0, 2] * np.eye(3)
 
-        J[res_idx + 6, base_b] = R_ji_ig[2, 0]
-        J[res_idx + 6, base_b + 3] = R_ji_ig[2, 1]
-        J[res_idx + 6, base_b + 6] = R_ji_ig[2, 2]
-        J[res_idx + 7, base_b + 1] = R_ji_ig[2, 0]
-        J[res_idx + 7, base_b + 4] = R_ji_ig[2, 1]
-        J[res_idx + 7, base_b + 7] = R_ji_ig[2, 2]
-        J[res_idx + 8, base_b + 2] = R_ji_ig[2, 0]
-        J[res_idx + 8, base_b + 5] = R_ji_ig[2, 1]
-        J[res_idx + 8, base_b + 8] = R_ji_ig[2, 2]
+        J[res_idx + 3: res_idx + 6, base_b: base_b + 3] = R_bg_z[1, 0] * np.eye(3)
+        J[res_idx + 3: res_idx + 6, base_b + 3: base_b + 6] = R_bg_z[1, 1] * np.eye(3)
+        J[res_idx + 3: res_idx + 6, base_b + 6: base_b + 9] = R_bg_z[1, 2] * np.eye(3)
 
-        J[res_idx + 9:res_idx + 12, base_b + 9:base_b +
-            12] = T_ba_z[:3, :3].dot(T_a[:3, :3].transpose())
-    A = np.linalg.multi_dot([J.transpose(), np.linalg.inv(cov), J])
-    b = np.linalg.multi_dot([J.transpose(), np.linalg.inv(cov), -r])
-    dx = np.linalg.inv(A).dot(b)
-    for i in range(len(poses_est)):
-        poses_est[i][0:3, 0:3] = poses_est[i][0:3, 0:3] + \
-            dx[12 * i:12 * i + 9].reshape(3, 3)
-        # Polarization
-        U, _, V = np.linalg.svd(poses_est[i][0:3, 0:3], full_matrices=True)
-        S = np.eye(3)
-        S[2, 2] = 1 if np.linalg.det(U) * np.linalg.det(V) > 0 else -1
-        poses_est[i][0:3, 0:3] = U.dot(S).dot(V)
-        # print(dx[12*i+9:12*i+12])
-        poses_est[i][0:3, [3]] = poses_est[i][0:3, [3]] + dx[12 * i + 9:12 * i + 12]
-    print("residual: ", np.linalg.norm(r))
+        J[res_idx + 6: res_idx + 9, base_b: base_b + 3] = R_bg_z[2, 0] * np.eye(3)
+        J[res_idx + 6: res_idx + 9, base_b + 3: base_b + 6] = R_bg_z[2, 1] * np.eye(3)
+        J[res_idx + 6: res_idx + 9, base_b + 6: base_b + 9] = R_bg_z[2, 2] * np.eye(3)
+
+        J[res_idx + 9:res_idx + 12, t_idx] = R_ba_z.dot(R_a.transpose())
+    if cal_jacobian:
+        return (J, r)
+    else:
+        return r
 
 
 class Arrow3D(FancyArrowPatch):
