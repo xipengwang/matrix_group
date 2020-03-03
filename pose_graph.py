@@ -301,11 +301,6 @@ def J_r_for_matrix(*, poses_init, poses_est, pose_links, Z, cal_jacobian):
         res_idx = 12 * (i + 1)
         R_ab_z = Z[i][:3, :3]
         t_ab_z = Z[i][:3, [3]]
-        R_ba_z = R_ab_z.transpose()
-        t_ba_z = -R_ab_z.transpose().dot(t_ab_z)
-        # T_ba_z = np.linalg.inv(Z[i])
-        # assert(np.allclose(R_ba_z, T_ba_z[:3, :3]))
-        # assert(np.allclose(t_ba_z, T_ba_z[:3, [3]]))
         T_a = poses_est[a]
         T_b = poses_est[b]
         R_a = T_a[:3, :3]
@@ -319,33 +314,37 @@ def J_r_for_matrix(*, poses_init, poses_est, pose_links, Z, cal_jacobian):
         # assert(np.allclose(t_ab, T_ab[:3, [3]]))
         # assert(np.allclose(R_ab, T_ab[:3, :3]))
         r[res_idx:res_idx +
-          9] = (R_ba_z.dot(R_ab) - np.eye(3)).reshape(9, 1)
-        r[res_idx + 9:res_idx + 12] = R_ba_z.dot(t_ab) + t_ba_z
+          9] = (R_ab - R_ab_z).reshape(9, 1)
+        r[res_idx + 9:res_idx + 12] = t_ab - t_ab_z
         if not cal_jacobian:
             continue
 
         # J for pose_a.
         base_a = a * 12
-        R_idx = range(base_a, base_a + 9)
         t_idx = range(base_a + 9, base_a + 12)
-        for idx in range(9):
-            row = idx // 3
-            col = idx % 3
-            # R_a
-            J[res_idx + idx, R_idx] = R_ba_z[[row], :].transpose().dot(R_b[:, [col]].transpose()).transpose().reshape(1, 9)
-        for idx in range(9, 12):
-            row = (idx - 9) % 3
-            # R_a
-            J[res_idx + idx, R_idx] = R_ba_z[[row], :].transpose().dot(tb_minus_ta[:].transpose()).transpose().reshape(1, 9)
+        J[res_idx: res_idx + 3, [base_a + 0]] = R_b[[0], :].transpose()
+        J[res_idx: res_idx + 3, [base_a + 3]] = R_b[[1], :].transpose()
+        J[res_idx: res_idx + 3, [base_a + 6]] = R_b[[2], :].transpose()
+
+        J[res_idx + 3: res_idx + 6, [base_a + 1]] = R_b[[0], :].transpose()
+        J[res_idx + 3: res_idx + 6, [base_a + 4]] = R_b[[1], :].transpose()
+        J[res_idx + 3: res_idx + 6, [base_a + 7]] = R_b[[2], :].transpose()
+
+        J[res_idx + 6: res_idx + 9, [base_a + 2]] = R_b[[0], :].transpose()
+        J[res_idx + 6: res_idx + 9, [base_a + 5]] = R_b[[1], :].transpose()
+        J[res_idx + 6: res_idx + 9, [base_a + 8]] = R_b[[2], :].transpose()
+
+        J[res_idx + 9 : res_idx + 12, base_a: base_a + 3] = tb_minus_ta[0, 0] * np.eye(3)
+        J[res_idx + 9 : res_idx + 12, base_a + 3: base_a + 6] = tb_minus_ta[1, 0] * np.eye(3)
+        J[res_idx + 9 : res_idx + 12, base_a + 6: base_a + 9] = tb_minus_ta[2, 0] * np.eye(3)
 
         # t_a
-        J[res_idx + 9:res_idx + 12, t_idx] = -R_ba_z.dot(R_a.transpose())
+        J[res_idx + 9:res_idx + 12, t_idx] = -R_a.transpose()
 
         # J for pose_b.
         base_b = b * 12
-        R_idx = range(base_b, base_b + 9)
         t_idx = range(base_b + 9, base_b + 12)
-        R_bg_z = R_ba_z.dot(R_a.transpose())
+        R_bg_z = R_a.transpose()
 
         J[res_idx: res_idx + 3, base_b: base_b + 3] = R_bg_z[0, 0] * np.eye(3)
         J[res_idx: res_idx + 3, base_b + 3: base_b + 6] = R_bg_z[0, 1] * np.eye(3)
@@ -359,7 +358,7 @@ def J_r_for_matrix(*, poses_init, poses_est, pose_links, Z, cal_jacobian):
         J[res_idx + 6: res_idx + 9, base_b + 3: base_b + 6] = R_bg_z[2, 1] * np.eye(3)
         J[res_idx + 6: res_idx + 9, base_b + 6: base_b + 9] = R_bg_z[2, 2] * np.eye(3)
 
-        J[res_idx + 9:res_idx + 12, t_idx] = R_ba_z.dot(R_a.transpose())
+        J[res_idx + 9:res_idx + 12, t_idx] = R_a.transpose()
     if cal_jacobian:
         return (J, r)
     else:
