@@ -12,16 +12,20 @@ import mpl_toolkits.mplot3d.proj3d as proj3d
 import cv2 as cv
 import argparse
 import sys
+import os
 
+from objloader_simple import *
 import numpy as np
 np.set_printoptions(precision=3, linewidth=300,
                     suppress=True, threshold=sys.maxsize)
 
 
+dir_name = os.getcwd()
+obj = OBJ(os.path.join(dir_name, './models/wolf.obj'), swapyz=True)
 use_perfect_detector = True
-kX = 2.0
-kY = 0.0
-kZ = 5.0
+kX = 3.0
+kY = -6.0
+kZ = 6.0
 kTileWidth = 0.5
 kCheckerBoardSize = 0.5
 kImageWidth = 64 * 10
@@ -141,13 +145,14 @@ def main():
 
     cv.imshow('CheckerBoardImage', image)
     cv.waitKey(0)
+    render(image_corners, obj, kIntrinsic.dot(pose_c_tag[0:3, :]), color=False)
     cv.imshow('CheckerBoardCorners', image_corners)
     cv.waitKey(0)
     cv.destroyAllWindows()
 
 
 def _hack_way_finding_matches(corners):
-    image_corners = np.zeros((kImageHeight, kImageWidth, 1), np.uint8)
+    image_corners = np.zeros((kImageHeight, kImageWidth, 3), np.uint8)
     clusters = []
     for i in corners:
         x, y = i.ravel()
@@ -336,6 +341,38 @@ def pathpatch_translate(pathpatch, delta):
     """
     pathpatch._segment3d += delta
 
+def render(img, obj, projection, color=False):
+    """
+    Render a loaded obj model into the current video frame
+    """
+    vertices = obj.vertices
+    scale_matrix = np.eye(3) * 0.001
+
+    for face in obj.faces:
+        face_vertices = face[0]
+        points = np.array([vertices[vertex - 1] for vertex in face_vertices])
+        points = np.dot(points, scale_matrix)
+        # render model in the middle of the reference surface. To do so,
+        # model points must be displaced
+        points = np.array([[p[0], p[1], p[2]] for p in points])
+        dst = cv.perspectiveTransform(points.reshape(-1, 1, 3), projection)
+        imgpts = np.int32(dst)
+        if color is False:
+            cv.fillConvexPoly(img, imgpts, (137, 27, 211))
+        else:
+            color = hex_to_rgb(face[-1])
+            color = color[::-1]  # reverse
+            cv.fillConvexPoly(img, imgpts, color)
+
+    return img
+
+def hex_to_rgb(hex_color):
+    """
+    Helper function to convert hex strings to RGB
+    """
+    hex_color = hex_color.lstrip('#')
+    h_len = len(hex_color)
+    return tuple(int(hex_color[i:i + h_len // 3], 16) for i in range(0, h_len, h_len // 3))
 
 if __name__ == '__main__':
     sys.exit(main())
